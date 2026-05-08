@@ -1,0 +1,9 @@
+{
+  "csv": "フォームの回答.csv",
+  "template": "template/template.xlsx",
+  "output_dir": "artifacts",
+  "output_xlsx": "captions.xlsx",
+  "output_pdf": "captions.pdf",
+  "output_pdf_2up": "captions_2up.pdf",
+  "output_pdf_dir": "captions_pages"
+}
