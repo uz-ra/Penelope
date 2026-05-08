@@ -50,6 +50,7 @@ CELL_MAP_NO_CAPTION = {
 
 LINE_CAPACITY_UNITS = 32
 LINE_HEIGHT = 44
+CAPTION_HEIGHT_SCALE = 0.3
 TEMPLATE_MIN_COL = 1
 TEMPLATE_MAX_COL = 6
 TEMPLATE_MIN_ROW = 1
@@ -94,7 +95,7 @@ def estimate_caption_height(text: str) -> int:
         return LINE_HEIGHT
     units = _text_width_units(text)
     lines = max(1, math.ceil(units / LINE_CAPACITY_UNITS))
-    return max(LINE_HEIGHT, lines * LINE_HEIGHT)
+    return max(LINE_HEIGHT, lines * LINE_HEIGHT * CAPTION_HEIGHT_SCALE)
 
 
 def _mm_to_points(mm: float) -> float:
