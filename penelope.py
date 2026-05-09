@@ -2,11 +2,9 @@
 import argparse
 import csv
 import json
-import math
 import re
 import subprocess
 import tempfile
-import unicodedata
 from copy import copy
 from pathlib import Path
 
@@ -16,6 +14,9 @@ from openpyxl.utils import get_column_letter
 FIELD_MAP = {
     "name": "表記する名前",
     "title": "作品タイトル / Title",
+    "university": "所属大学 / University",
+    "major": "学部・学科 / Major",
+    "grade": "学年 / Grade",
     "camera": "使用機材 / Camera",
     "lens": "使用レンズ / Lens",
     "shutter": "シャッタスピード / Shutter speed",
@@ -26,46 +27,58 @@ FIELD_MAP = {
 }
 
 CELL_MAP_WITH_CAPTION = {
-    "title": "B2",
-    "name": "C3",
-    "camera": "A4",
-    "lens": "D4",
-    "shutter": "B5",
-    "aperture": "C5",
-    "iso": "E5",
-    "location": "A6",
-    "caption": "A9",
+    "title": "C3",
+    "location": "R3",
+    "affiliation": "C6",
+    "name": "C7",
+    "camera": "R6",
+    "lens": "R9",
+    "aperture": "R12",
+    "shutter": "V12",
+    "iso": "Z12",
+    "caption": "C10",
 }
 
 CELL_MAP_NO_CAPTION = {
-    "title": "C2",
-    "name": "C3",
-    "camera": "A4",
-    "lens": "D4",
-    "shutter": "A5",
-    "aperture": "C5",
-    "iso": "E5",
-    "location": "A6",
+    "title": "C5",
+    "location": "R3",
+    "affiliation": "C9",
+    "name": "C10",
+    "camera": "R6",
+    "lens": "R9",
+    "aperture": "R12",
+    "shutter": "V12",
+    "iso": "Z12",
 }
 
-LINE_CAPACITY_UNITS = 32
-LINE_HEIGHT = 44
-CAPTION_HEIGHT_SCALE = 0.3
 TEMPLATE_MIN_COL = 1
-TEMPLATE_MAX_COL = 6
+TEMPLATE_MAX_COL = 30
 TEMPLATE_MIN_ROW = 1
-TEMPLATE_MAX_ROW = 10
-A4_HEIGHT_MM = 297
+TEMPLATE_MAX_ROW = 14
+CAPTION_WIDTH_PX = 480
+CAPTION_HEIGHT_PX = 224
+CAPTION_TRIM_TOLERANCE = 1
+A4_WIDTH_MM = 210
 CAPTION_EMPTY_PHRASES = ("キャプション無し", "キャプションなし")
 PRINT_AREA = f"A1:{get_column_letter(TEMPLATE_MAX_COL)}{TEMPLATE_MAX_ROW}"
 PACKING_GAP = 0.0
 DEFAULT_COL_WIDTH = 8.43
+STATIC_TEXT_CELLS = {"U12", "Y12"}
 
 
-def clear_block_values(ws, min_col: int, max_col: int, min_row: int, max_row: int) -> None:
+def clear_block_values(
+    ws,
+    min_col: int,
+    max_col: int,
+    min_row: int,
+    max_row: int,
+    keep_cells: set[str] | None = None,
+) -> None:
     for row in ws.iter_rows(min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col):
         for cell in row:
             if cell.value is None:
+                continue
+            if keep_cells and cell.coordinate in keep_cells:
                 continue
             if cell.coordinate in ws.merged_cells:
                 is_start = False
@@ -77,25 +90,6 @@ def clear_block_values(ws, min_col: int, max_col: int, min_row: int, max_row: in
                     continue
             cell.value = None
 
-
-
-def _text_width_units(text: str) -> int:
-    width = 0
-    for ch in text:
-        if unicodedata.east_asian_width(ch) in {"W", "F"}:
-            width += 2
-        else:
-            width += 1
-    return width
-
-
-def estimate_caption_height(text: str) -> int:
-    text = (text or "").strip()
-    if not text:
-        return LINE_HEIGHT
-    units = _text_width_units(text)
-    lines = max(1, math.ceil(units / LINE_CAPACITY_UNITS))
-    return max(LINE_HEIGHT, lines * LINE_HEIGHT * CAPTION_HEIGHT_SCALE)
 
 
 def _mm_to_points(mm: float) -> float:
@@ -166,19 +160,6 @@ def _print_bounds(ws) -> tuple[int, int]:
     return max_col, max_row
 
 
-def max_caption_height(ws) -> float:
-    margins = ws.page_margins
-    top = (margins.top if margins and margins.top is not None else 0.75) * 72
-    bottom = (margins.bottom if margins and margins.bottom is not None else 0.75) * 72
-    available = _mm_to_points(A4_HEIGHT_MM) - (top + bottom)
-    fixed_height = 0
-    for row_index in range(TEMPLATE_MIN_ROW, TEMPLATE_MAX_ROW + 1):
-        if row_index == 9:
-            continue
-        fixed_height += _row_height(ws, row_index)
-    return max(LINE_HEIGHT, available - fixed_height)
-
-
 def normalize_caption(value: str) -> str:
     value = (value or "").strip()
     if not value:
@@ -189,9 +170,23 @@ def normalize_caption(value: str) -> str:
     return value
 
 
-def normalize_shutter(value: str) -> str:
+def normalize_optional_text(value: str) -> str:
     value = (value or "").strip()
     if not value or value in {"-", "ー", "ｰ"}:
+        return ""
+    return value
+
+
+def normalize_affiliation_part(value: str) -> str:
+    value = normalize_optional_text(value)
+    if not value:
+        return ""
+    return value.split("/", 1)[0].strip()
+
+
+def normalize_shutter(value: str) -> str:
+    value = normalize_optional_text(value)
+    if not value:
         return ""
     if re.fullmatch(r"[0-9./]+", value):
         return f"{value}s"
@@ -199,8 +194,8 @@ def normalize_shutter(value: str) -> str:
 
 
 def normalize_aperture(value: str) -> str:
-    value = (value or "").strip()
-    if not value or value in {"-", "ー", "ｰ"}:
+    value = normalize_optional_text(value)
+    if not value:
         return ""
     if value[0] in {"F", "f", "ƒ"}:
         return f"ƒ{value[1:]}" if value[0] != "ƒ" else value
@@ -208,8 +203,8 @@ def normalize_aperture(value: str) -> str:
 
 
 def normalize_iso(value: str) -> str:
-    value = (value or "").strip()
-    if not value or value in {"-", "ー", "ｰ"}:
+    value = normalize_optional_text(value)
+    if not value:
         return ""
     upper = value.upper()
     if upper.startswith("ISO"):
@@ -233,13 +228,20 @@ def load_rows(csv_path: Path) -> list[dict[str, str]]:
 
 
 def extract_values(row: dict[str, str]) -> dict[str, str]:
+    affiliation_parts = [
+        normalize_affiliation_part(row.get(FIELD_MAP["university"])),
+        normalize_affiliation_part(row.get(FIELD_MAP["major"])),
+        normalize_affiliation_part(row.get(FIELD_MAP["grade"])),
+    ]
+    affiliation = " ".join(part for part in affiliation_parts if part)
     return {
         "name": (row.get(FIELD_MAP["name"]) or "").strip(),
         "title": (row.get(FIELD_MAP["title"]) or "").strip(),
+        "affiliation": affiliation,
         "camera": (row.get(FIELD_MAP["camera"]) or "").strip(),
         "lens": (row.get(FIELD_MAP["lens"]) or "").strip(),
-        "shutter": normalize_shutter(row.get(FIELD_MAP["shutter"])),
         "aperture": normalize_aperture(row.get(FIELD_MAP["aperture"])),
+        "shutter": normalize_shutter(row.get(FIELD_MAP["shutter"])),
         "iso": normalize_iso(row.get(FIELD_MAP["iso"])),
         "location": (row.get(FIELD_MAP["location"]) or "").strip(),
         "caption": normalize_caption(row.get(FIELD_MAP["caption"])),
@@ -253,36 +255,24 @@ def fill_caption(ws, values: dict[str, str], cell_map: dict[str, str]) -> None:
     for key, cell in cell_map.items():
         ws[cell].value = values.get(key) if values.get(key) else None
 
-    if values.get("location"):
-        ws.row_dimensions[6].height = _row_height(ws, 6)
-    else:
-        ws.row_dimensions[6].height = 0
-
-    if values.get("caption"):
-        ws.row_dimensions[9].height = LINE_HEIGHT
-        caption_height_cap = max_caption_height(ws)
-        desired_height = estimate_caption_height(values["caption"])
-        ws.row_dimensions[9].height = min(desired_height, caption_height_cap)
-    else:
-        ws.row_dimensions[9].height = 0
-
 
 def apply_print_settings(ws) -> None:
-    max_col, max_row = _print_bounds(ws)
-    ws.print_area = f"A1:{get_column_letter(max_col)}{max_row}"
+    ws.print_area = PRINT_AREA
     ws.page_margins.left = 0
     ws.page_margins.right = 0
     ws.page_margins.top = 0
     ws.page_margins.bottom = 0
     ws.page_margins.header = 0
     ws.page_margins.footer = 0
-    width_points, height_points = _sheet_size_points(ws, max_col, max_row)
+    a4_width_points = _mm_to_points(A4_WIDTH_MM)
+    height_ratio = CAPTION_HEIGHT_PX / CAPTION_WIDTH_PX
+    paper_height_points = a4_width_points * height_ratio
     ws.page_setup.paperSize = 0
-    ws.page_setup.paperWidth = f"{width_points / 72:.3f}in"
-    ws.page_setup.paperHeight = f"{height_points / 72:.3f}in"
-    ws.page_setup.scale = 100
-    ws.page_setup.fitToWidth = None
-    ws.page_setup.fitToHeight = None
+    ws.page_setup.paperWidth = f"{a4_width_points / 72:.3f}in"
+    ws.page_setup.paperHeight = f"{paper_height_points / 72:.3f}in"
+    ws.page_setup.scale = None
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 1
 
 
 def export_pdf(xlsx_path: Path, output_dir: Path) -> Path:
@@ -419,6 +409,20 @@ def _find_border_rect(page):
     return largest
 
 
+def _trim_rect_to_caption_size(rect: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    x0, y0, x1, y1 = rect
+    width = x1 - x0
+    height = y1 - y0
+    if width < CAPTION_WIDTH_PX - CAPTION_TRIM_TOLERANCE:
+        return rect
+    if height < CAPTION_HEIGHT_PX - CAPTION_TRIM_TOLERANCE:
+        return rect
+    if width - CAPTION_WIDTH_PX > CAPTION_TRIM_TOLERANCE or height - CAPTION_HEIGHT_PX > CAPTION_TRIM_TOLERANCE:
+        x1 = x0 + CAPTION_WIDTH_PX
+        y0 = y1 - CAPTION_HEIGHT_PX
+    return (x0, y0, x1, y1)
+
+
 def _trim_page_to_bbox(page):
     try:
         from pypdf import PageObject, Transformation
@@ -430,6 +434,7 @@ def _trim_page_to_bbox(page):
     if rect is None:
         box = page.cropbox
         rect = (float(box.lower_left[0]), float(box.lower_left[1]), float(box.upper_right[0]), float(box.upper_right[1]))
+    rect = _trim_rect_to_caption_size(rect)
 
     rect_obj = RectangleObject(rect)
     width = float(rect_obj.width)
@@ -493,11 +498,9 @@ def make_2up_pdf(source_pdf: Path, output_pdf: Path, pages_override: list | None
     writer = PdfWriter()
     base_width = _mm_to_points(210)
     base_height = _mm_to_points(297)
-    half_width = base_width / 2
 
     current_page = PageObject.create_blank_page(width=base_width, height=base_height)
-    column = 0
-    y_positions = [base_height, base_height]
+    y_position = base_height
     has_content = False
 
     for page in pages:
@@ -508,33 +511,22 @@ def make_2up_pdf(source_pdf: Path, output_pdf: Path, pages_override: list | None
         box = trimmed.mediabox
         width = float(box.width)
         height = float(box.height)
-        scale = half_width / width
+        scale = base_width / width
         scaled_height = height * scale
         if scaled_height > base_height and height:
             scale = base_height / height
             scaled_height = height * scale
         required_height = scaled_height + PACKING_GAP
 
-        if required_height > y_positions[column]:
-            if column == 0:
-                column = 1
-            else:
-                writer.add_page(current_page)
-                current_page = PageObject.create_blank_page(width=base_width, height=base_height)
-                column = 0
-                y_positions = [base_height, base_height]
-                has_content = False
-
-        if required_height > y_positions[column]:
+        if required_height > y_position:
             writer.add_page(current_page)
             current_page = PageObject.create_blank_page(width=base_width, height=base_height)
-            column = 0
-            y_positions = [base_height, base_height]
+            y_position = base_height
             has_content = False
 
-        y_positions[column] -= required_height
-        x_offset = 0 if column == 0 else half_width
-        y_offset = y_positions[column]
+        y_position -= required_height
+        x_offset = 0
+        y_offset = y_position
 
         page_copy = copy(trimmed)
         current_page.merge_transformed_page(
@@ -543,14 +535,11 @@ def make_2up_pdf(source_pdf: Path, output_pdf: Path, pages_override: list | None
         )
         has_content = True
 
-        if y_positions[column] <= 0 and column == 1:
+        if y_position <= 0:
             writer.add_page(current_page)
             current_page = PageObject.create_blank_page(width=base_width, height=base_height)
-            column = 0
-            y_positions = [base_height, base_height]
+            y_position = base_height
             has_content = False
-        elif y_positions[column] <= 0:
-            column = 1
 
     if current_page is not None and has_content:
         writer.add_page(current_page)
@@ -636,7 +625,14 @@ def main() -> None:
 
         ws = wb.copy_worksheet(base_template)
         ws.title = f"Caption_{index:03d}"
-        clear_block_values(ws, TEMPLATE_MIN_COL, TEMPLATE_MAX_COL, TEMPLATE_MIN_ROW, TEMPLATE_MAX_ROW)
+        clear_block_values(
+            ws,
+            TEMPLATE_MIN_COL,
+            TEMPLATE_MAX_COL,
+            TEMPLATE_MIN_ROW,
+            TEMPLATE_MAX_ROW,
+            keep_cells=STATIC_TEXT_CELLS,
+        )
         fill_caption(ws, values, cell_map)
         apply_print_settings(ws)
 
