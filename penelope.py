@@ -5,17 +5,24 @@ import json
 import re
 import subprocess
 import tempfile
+import zipfile
+from io import BytesIO
 from copy import copy
 from pathlib import Path
 
+import qrcode
+from PIL import Image as PILImage
 from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor, XDRPositiveSize2D
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.units import pixels_to_EMU
 
 FIELD_MAP = {
     "name": "表記する名前",
     "title": "作品タイトル / Title",
+    "sns": "SNSアカウント",
     "university": "所属大学 / University",
-    "major": "学部・学科 / Major",
     "grade": "学年 / Grade",
     "camera": "使用機材 / Camera",
     "lens": "使用レンズ / Lens",
@@ -55,15 +62,23 @@ TEMPLATE_MIN_COL = 1
 TEMPLATE_MAX_COL = 30
 TEMPLATE_MIN_ROW = 1
 TEMPLATE_MAX_ROW = 14
-CAPTION_WIDTH_PX = 480
-CAPTION_HEIGHT_PX = 224
+CAPTION_WIDTH_PX = 840
+CAPTION_HEIGHT_PX = 392
 CAPTION_TRIM_TOLERANCE = 1
-A4_WIDTH_MM = 210
+A3_WIDTH_MM = 297
+A3_HEIGHT_MM = 420
 CAPTION_EMPTY_PHRASES = ("キャプション無し", "キャプションなし")
 PRINT_AREA = f"A1:{get_column_letter(TEMPLATE_MAX_COL)}{TEMPLATE_MAX_ROW}"
 PACKING_GAP = 0.0
 DEFAULT_COL_WIDTH = 8.43
 STATIC_TEXT_CELLS = {"U12", "Y12"}
+FONT_CHECK_CELLS = {"R3", "R6", "R9", "R12", "V12", "Z12"}
+JAPANESE_FONT_NAME = "游ゴシック"
+QR_CELL_WITH_CAPTION = "L6"
+QR_CELL_NO_CAPTION = "L9"
+QR_BORDER_MODULES = 1
+QR_DOWNSCALE_FACTOR = 4
+QR_FALLBACK_SIZE_PX = 56
 
 
 def clear_block_values(
@@ -94,6 +109,10 @@ def clear_block_values(
 
 def _mm_to_points(mm: float) -> float:
     return mm * 72 / 25.4
+
+
+def _points_to_pixels(points: float) -> int:
+    return int(round(points * 96 / 72))
 
 
 def _default_row_height(ws) -> float:
@@ -214,6 +233,22 @@ def normalize_iso(value: str) -> str:
     return value
 
 
+def _contains_japanese(text: str) -> bool:
+    for ch in text:
+        code = ord(ch)
+        if 0x3040 <= code <= 0x30FF:
+            return True
+        if 0x4E00 <= code <= 0x9FFF:
+            return True
+        if 0x3400 <= code <= 0x4DBF:
+            return True
+        if 0xFF66 <= code <= 0xFF9F:
+            return True
+        if 0x3000 <= code <= 0x303F:
+            return True
+    return False
+
+
 def load_rows(csv_path: Path) -> list[dict[str, str]]:
     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
@@ -230,12 +265,12 @@ def load_rows(csv_path: Path) -> list[dict[str, str]]:
 def extract_values(row: dict[str, str]) -> dict[str, str]:
     affiliation_parts = [
         normalize_affiliation_part(row.get(FIELD_MAP["university"])),
-        normalize_affiliation_part(row.get(FIELD_MAP["major"])),
         normalize_affiliation_part(row.get(FIELD_MAP["grade"])),
     ]
     affiliation = " ".join(part for part in affiliation_parts if part)
     return {
         "name": (row.get(FIELD_MAP["name"]) or "").strip(),
+        "sns": normalize_optional_text(row.get(FIELD_MAP["sns"])),
         "title": (row.get(FIELD_MAP["title"]) or "").strip(),
         "affiliation": affiliation,
         "camera": (row.get(FIELD_MAP["camera"]) or "").strip(),
@@ -248,12 +283,105 @@ def extract_values(row: dict[str, str]) -> dict[str, str]:
     }
 
 
-def fill_caption(ws, values: dict[str, str], cell_map: dict[str, str]) -> None:
-    if not any(values.values()):
+def _cell_area_pixels(ws, cell_id: str) -> tuple[int, int]:
+    merge_range = None
+    for merged in ws.merged_cells.ranges:
+        if cell_id in merged:
+            merge_range = merged
+            break
+
+    if merge_range:
+        min_col, min_row, max_col, max_row = merge_range.bounds
+    else:
+        cell = ws[cell_id]
+        min_col = max_col = cell.column
+        min_row = max_row = cell.row
+
+    width_points = sum(_column_width_points(ws, col) for col in range(min_col, max_col + 1))
+    height_points = sum(_row_height(ws, row) for row in range(min_row, max_row + 1))
+    return _points_to_pixels(width_points), _points_to_pixels(height_points)
+
+
+def _build_qr_image(value: str, size_px: int) -> XLImage:
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=QR_BORDER_MODULES, box_size=10)
+    qr.add_data(value)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    if size_px:
+        render_px = size_px * QR_DOWNSCALE_FACTOR
+        if image.size != (render_px, render_px):
+            image = image.resize((render_px, render_px), resample=PILImage.NEAREST)
+        image = image.resize((size_px, size_px), resample=PILImage.LANCZOS)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    xl_image = XLImage(buffer)
+    if size_px:
+        xl_image.width = size_px
+        xl_image.height = size_px
+    return xl_image
+
+
+def _load_qr_placeholder_sizes(template_path: Path) -> tuple[int | None, int | None]:
+    try:
+        with zipfile.ZipFile(template_path, "r") as zf:
+            media_files = [name for name in zf.namelist() if name.startswith("xl/media/")]
+            if not media_files:
+                return None, None
+            media_files.sort()
+            sizes: list[int] = []
+            for name in media_files[:2]:
+                data = zf.read(name)
+                with PILImage.open(BytesIO(data)) as img:
+                    sizes.append(min(img.size))
+            if len(sizes) == 1:
+                return sizes[0], sizes[0]
+            return sizes[0], sizes[1]
+    except Exception:
+        return None, None
+
+
+def add_qr_code(ws, value: str | None, cell_id: str, size_px: int | None = None) -> None:
+    text = (value or "").strip()
+    if not text:
+        return
+    if size_px is None or size_px <= 0:
+        width_px, height_px = _cell_area_pixels(ws, cell_id)
+        size_px = min(width_px, height_px)
+        if size_px <= 0:
+            size_px = QR_FALLBACK_SIZE_PX
+    qr_image = _build_qr_image(text, size_px)
+    anchor_cell = ws[cell_id]
+    from_marker = AnchorMarker(col=anchor_cell.column - 1, row=anchor_cell.row - 1, colOff=0, rowOff=0)
+    ext = XDRPositiveSize2D(cx=pixels_to_EMU(size_px), cy=pixels_to_EMU(size_px))
+    qr_image.anchor = OneCellAnchor(_from=from_marker, ext=ext)
+    ws.add_image(qr_image)
+
+
+def fill_caption(
+    ws,
+    values: dict[str, str],
+    cell_map: dict[str, str],
+    qr_cell: str | None = None,
+    qr_size_px: int | None = None,
+) -> None:
+    if not any(value for key, value in values.items() if key != "sns"):
         return
 
     for key, cell in cell_map.items():
         ws[cell].value = values.get(key) if values.get(key) else None
+
+    for cell_id in FONT_CHECK_CELLS:
+        cell = ws[cell_id]
+        if cell.value is None:
+            continue
+        if _contains_japanese(str(cell.value)):
+            font = copy(cell.font)
+            font.name = JAPANESE_FONT_NAME
+            cell.font = font
+
+    if qr_cell:
+        add_qr_code(ws, values.get("sns"), qr_cell, size_px=qr_size_px)
 
 
 def apply_print_settings(ws) -> None:
@@ -264,15 +392,12 @@ def apply_print_settings(ws) -> None:
     ws.page_margins.bottom = 0
     ws.page_margins.header = 0
     ws.page_margins.footer = 0
-    a4_width_points = _mm_to_points(A4_WIDTH_MM)
-    height_ratio = CAPTION_HEIGHT_PX / CAPTION_WIDTH_PX
-    paper_height_points = a4_width_points * height_ratio
-    ws.page_setup.paperSize = 0
-    ws.page_setup.paperWidth = f"{a4_width_points / 72:.3f}in"
-    ws.page_setup.paperHeight = f"{paper_height_points / 72:.3f}in"
-    ws.page_setup.scale = None
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 1
+    ws.page_setup.paperSize = 8
+    ws.page_setup.paperWidth = None
+    ws.page_setup.paperHeight = None
+    ws.page_setup.scale = 100
+    ws.page_setup.fitToWidth = None
+    ws.page_setup.fitToHeight = None
 
 
 def export_pdf(xlsx_path: Path, output_dir: Path) -> Path:
@@ -289,6 +414,14 @@ def export_pdf(xlsx_path: Path, output_dir: Path) -> Path:
         'tell application "Microsoft Excel"',
         'activate',
         f'set wb to open workbook workbook file name (POSIX file "{xlsx_str}")',
+        'try',
+        'tell wb',
+        'set sheet_count to count of worksheets',
+        'if sheet_count > 1 then',
+        'select worksheets',
+        'end if',
+        'end tell',
+        'end try',
         f'set pdf_file to POSIX file "{pdf_str}"',
         'save workbook as wb filename pdf_file file format PDF file format',
         'close wb saving no',
@@ -616,12 +749,15 @@ def main() -> None:
     template_no_caption = wb.sheetnames[1] if len(wb.sheetnames) > 1 else wb.sheetnames[0]
     ws_with_caption = wb[template_with_caption]
     ws_no_caption = wb[template_no_caption]
+    qr_size_with_caption, qr_size_no_caption = None, None
 
     for index, row in enumerate(rows, start=1):
         values = extract_values(row)
         use_no_caption = not values.get("caption")
         base_template = ws_no_caption if use_no_caption else ws_with_caption
         cell_map = CELL_MAP_NO_CAPTION if use_no_caption else CELL_MAP_WITH_CAPTION
+        qr_cell = QR_CELL_NO_CAPTION if use_no_caption else QR_CELL_WITH_CAPTION
+        qr_size_px = QR_FALLBACK_SIZE_PX
 
         ws = wb.copy_worksheet(base_template)
         ws.title = f"Caption_{index:03d}"
@@ -633,7 +769,7 @@ def main() -> None:
             TEMPLATE_MAX_ROW,
             keep_cells=STATIC_TEXT_CELLS,
         )
-        fill_caption(ws, values, cell_map)
+        fill_caption(ws, values, cell_map, qr_cell, qr_size_px)
         apply_print_settings(ws)
 
     wb.remove(ws_with_caption)
